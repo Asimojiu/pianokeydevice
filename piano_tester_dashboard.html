@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Piano Tester Debug Dashboard</title>
+    <style>
+        body {
+            font-family: 'Courier New', monospace;
+            background: #000;
+            color: #00ff00;
+            margin: 20px;
+        }
+        .debug-section {
+            background: #111;
+            border: 1px solid #00ff00;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 10px 0;
+        }
+        .raw-data {
+            background: #222;
+            border: 1px solid #444;
+            border-radius: 4px;
+            padding: 10px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-size: 12px;
+            white-space: pre-wrap;
+        }
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 10px;
+        }
+        .metric {
+            background: #222;
+            padding: 10px;
+            border-radius: 4px;
+            text-align: center;
+        }
+        .metric-value {
+            font-size: 1.5em;
+            color: #ffff00;
+        }
+        button {
+            background: #333;
+            color: #00ff00;
+            border: 1px solid #00ff00;
+            padding: 10px 15px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 5px;
+        }
+        button:hover {
+            background: #444;
+        }
+        .status {
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .connected { background: rgba(0, 255, 0, 0.2); }
+        .disconnected { background: rgba(255, 0, 0, 0.2); color: #ff4040; }
+        .error { color: #ff4040; }
+        .success { color: #00ff00; }
+        .warning { color: #ffff00; }
+    </style>
+</head>
+<body>
+    <h1>🔍 Piano Tester Debug Dashboard</h1>
+    
+    <div class="debug-section">
+        <h3>Connection Status</h3>
+        <div id="connectionStatus" class="status disconnected">DISCONNECTED</div>
+        <button onclick="connectSerial()">Connect Serial Port</button>
+        <button onclick="sendCommand('help')">Send 'help'</button>
+        <button onclick="sendCommand('json on')">Send 'json on'</button>
+        <button onclick="sendCommand('stream on')">Send 'stream on'</button>
+        <button onclick="sendCommand('status')">Send 'status'</button>
+    </div>
+
+    <div class="debug-section">
+        <h3>Raw Data Received (Last 50 lines)</h3>
+        <div id="rawData" class="raw-data">Waiting for data...</div>
+        <button onclick="clearRawData()">Clear</button>
+        <button onclick="copyRawData()">Copy to Clipboard</button>
+    </div>
+
+    <div class="debug-section">
+        <h3>Parsed JSON Data</h3>
+        <div id="jsonData" class="raw-data">No JSON data received yet...</div>
+    </div>
+
+    <div class="debug-section">
+        <h3>Live Metrics (from parsed JSON)</h3>
+        <div class="metrics">
+            <div class="metric">
+                <div>Weight</div>
+                <div class="metric-value" id="weight">-</div>
+            </div>
+            <div class="metric">
+                <div>Delta</div>
+                <div class="metric-value" id="delta">-</div>
+            </div>
+            <div class="metric">
+                <div>Step</div>
+                <div class="metric-value" id="step">-</div>
+            </div>
+            <div class="metric">
+                <div>State</div>
+                <div class="metric-value" id="state">-</div>
+            </div>
+            <div class="metric">
+                <div>Data Count</div>
+                <div class="metric-value" id="dataCount">0</div>
+            </div>
+            <div class="metric">
+                <div>JSON Count</div>
+                <div class="metric-value" id="jsonCount">0</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="debug-section">
+        <h3>Debug Log</h3>
+        <div id="debugLog" class="raw-data">Debug messages will appear here...</div>
+        <button onclick="clearDebugLog()">Clear Debug Log</button>
+    </div>
+
+    <div class="debug-section">
+        <h3>Send Custom Command</h3>
+        <input type="text" id="customCommand" placeholder="Enter command..." style="width: 200px; background: #333; color: #00ff00; border: 1px solid #00ff00; padding: 5px;">
+        <button onclick="sendCustomCommand()">Send</button>
+    </div>
+
+    <script>
+        let serialPort = null;
+        let reader = null;
+        let isConnected = false;
+        let dataCount = 0;
+        let jsonCount = 0;
+        let rawDataLines = [];
+
+        function debugLog(message, level = 'info') {
+            const timestamp = new Date().toLocaleTimeString();
+            const logElement = document.getElementById('debugLog');
+            const colorClass = level === 'error' ? 'error' : level === 'warning' ? 'warning' : 'success';
+            
+            logElement.innerHTML += `<span class="${colorClass}">[${timestamp}] ${message}</span>\n`;
+            logElement.scrollTop = logElement.scrollHeight;
+        }
+
+        async function connectSerial() {
+            try {
+                debugLog('Requesting serial port...', 'info');
+                serialPort = await navigator.serial.requestPort();
+                await serialPort.open({ baudRate: 115200 });
+                
+                isConnected = true;
+                updateConnectionStatus(true);
+                debugLog('Connected successfully!', 'success');
+                
+                reader = serialPort.readable.getReader();
+                readSerialData();
+                
+                // Send initial commands
+                setTimeout(() => sendCommand('help'), 500);
+                setTimeout(() => sendCommand('json on'), 1000);
+                setTimeout(() => sendCommand('stream on'), 1500);
+                
+            } catch (error) {
+                debugLog(`Connection failed: ${error.message}`, 'error');
+                updateConnectionStatus(false);
+            }
+        }
+
+        async function readSerialData() {
+            try {
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    
+                    const text = new TextDecoder().decode(value);
+                    const lines = text.split('\n');
+                    
+                    for (const line of lines) {
+                        if (line.trim()) {
+                            processDataLine(line.trim());
+                        }
+                    }
+                }
+            } catch (error) {
+                debugLog(`Read error: ${error.message}`, 'error');
+                updateConnectionStatus(false);
+            }
+        }
+
+        function processDataLine(line) {
+            dataCount++;
+            document.getElementById('dataCount').textContent = dataCount;
+            
+            // Add to raw data display
+            rawDataLines.push(line);
+            if (rawDataLines.length > 50) {
+                rawDataLines.shift();
+            }
+            document.getElementById('rawData').textContent = rawDataLines.join('\n');
+            
+            // Try to parse as JSON
+            if (line.startsWith('{')) {
+                try {
+                    const data = JSON.parse(line);
+                    jsonCount++;
+                    document.getElementById('jsonCount').textContent = jsonCount;
+                    
+                    // Display parsed JSON
+                    document.getElementById('jsonData').textContent = JSON.stringify(data, null, 2);
+                    
+                    // Update metrics
+                    document.getElementById('weight').textContent = data.weight?.toFixed(1) || '-';
+                    document.getElementById('delta').textContent = data.delta?.toFixed(1) || '-';
+                    document.getElementById('step').textContent = data.step || '-';
+                    document.getElementById('state').textContent = data.state || '-';
+                    
+                    debugLog(`JSON parsed successfully: weight=${data.weight}g, state=${data.state}`, 'success');
+                    
+                } catch (error) {
+                    debugLog(`Failed to parse JSON: ${error.message}`, 'error');
+                    debugLog(`Raw line was: ${line}`, 'warning');
+                }
+            } else {
+                debugLog(`Non-JSON data: ${line}`, 'info');
+            }
+        }
+
+        function updateConnectionStatus(connected) {
+            const statusElement = document.getElementById('connectionStatus');
+            if (connected) {
+                statusElement.textContent = 'CONNECTED - Baud: 115200';
+                statusElement.className = 'status connected';
+            } else {
+                statusElement.textContent = 'DISCONNECTED';
+                statusElement.className = 'status disconnected';
+            }
+        }
+
+        async function sendCommand(command) {
+            if (!serialPort || !serialPort.writable) {
+                debugLog('Cannot send command - not connected', 'error');
+                return;
+            }
+            
+            try {
+                const writer = serialPort.writable.getWriter();
+                await writer.write(new TextEncoder().encode(command + '\n'));
+                writer.releaseLock();
+                debugLog(`Sent command: ${command}`, 'success');
+            } catch (error) {
+                debugLog(`Failed to send command: ${error.message}`, 'error');
+            }
+        }
+
+        function sendCustomCommand() {
+            const command = document.getElementById('customCommand').value.trim();
+            if (command) {
+                sendCommand(command);
+                document.getElementById('customCommand').value = '';
+            }
+        }
+
+        function clearRawData() {
+            rawDataLines = [];
+            document.getElementById('rawData').textContent = 'Raw data cleared...';
+        }
+
+        function clearDebugLog() {
+            document.getElementById('debugLog').innerHTML = 'Debug log cleared...\n';
+        }
+
+        function copyRawData() {
+            const text = rawDataLines.join('\n');
+            navigator.clipboard.writeText(text).then(() => {
+                debugLog('Raw data copied to clipboard', 'success');
+            }).catch(err => {
+                debugLog(`Failed to copy: ${err.message}`, 'error');
+            });
+        }
+
+        // Handle Enter key in custom command input
+        document.getElementById('customCommand').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendCustomCommand();
+            }
+        });
+
+        debugLog('Debug dashboard ready. Click "Connect Serial Port" to begin.', 'info');
+    </script>
+</body>
+</html>
