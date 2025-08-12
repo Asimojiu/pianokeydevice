@@ -107,6 +107,12 @@ float revBuf[REV_BUF_SZ];
 uint16_t revIdx = 0;
 uint16_t backStepsTaken = 0;
 
+// --- Inertia window: from first touch -> down-weight capture ---
+bool inertiaArmed = false;            // set at first touch (Δ > DELTA1_G)
+bool inertiaDoneThisCycle = false;    // printed already this forward cycle?
+uint32_t tTouchMs = 0;                // time of first touch
+uint8_t  touchGraphIdx = 0;           // ring index near first touch (for integration start)
+
 /* ------------------- Multi-Click Button Control ------------- */
 #define CLICK_TIMEOUT_MS 800      // Time window for multi-clicks (longer than multi long press)
 #define LONG_PRESS_MS 1500        // Long press threshold for single click
@@ -207,6 +213,42 @@ float steps2mm(unsigned long steps) {  // empirical factor
   return (steps * 10.0f) / 1005.0f;
 }
 
+// Integrate impulse above steady (downWeight) from ring index a→b (wrapping)
+// Uses tsHist[] (ms) and weightHist[] (0.1 g units). Clamp negative to 0.
+double integrateImpulseAboveDown(uint8_t idxA, uint8_t idxB, float downWeightG) {
+  auto advance = [](uint8_t i){ return (uint8_t)((i + 1) % MAX_SAMPLES); };
+
+  // Convert 0.1 g → g on read
+  auto asG = [](int16_t tenths){ return (float)tenths / 10.0f; };
+
+  double impulseNs = 0.0; // N·s
+  uint8_t i = idxA;
+  if (i == idxB) return 0.0; // no span
+
+  while (i != idxB) {
+    uint8_t j = advance(i);
+    // Handle wrap-around timestamps safely
+    uint32_t t0 = tsHist[i], t1 = tsHist[j];
+    // If ring crossed timer wrap or went backwards (rare), skip segment
+    if (t1 == t0) { i = j; continue; }
+    float dt = (t1 > t0) ? (t1 - t0) * 1e-3f : 0.0f; // ms -> s, guard
+    if (dt <= 0) { i = j; continue; }
+
+    float f0 = asG(weightHist[i]) - downWeightG;
+    float f1 = asG(weightHist[j]) - downWeightG;
+    // Clamp to positive (area above steady only)
+    if (f0 < 0) f0 = 0;
+    if (f1 < 0) f1 = 0;
+
+    float avg_g = 0.5f * (f0 + f1);          // in grams
+    double avg_N = (double)avg_g * 0.00980665; // g → N
+    impulseNs += avg_N * dt;                 // N·s
+
+    i = j;
+  }
+  return impulseNs;
+}
+
 void resetCycle() {
   forwardSteps = 0;
   delta10Captured = false;
@@ -218,8 +260,11 @@ void resetCycle() {
   downWeight = 0.0f;
   upWeight = 0.0f;
   aftertouchDist = 0.0f;
+  inertiaArmed = false;
+  inertiaDoneThisCycle = false;
 }
 
+#if 0
 // ===== Inertia Measurement Config =====
 const float TOUCH_LEVEL_G      = 2.0f;
 const float SLOPE_THRESH_G     = 2.0f;
@@ -314,15 +359,15 @@ void onForceSample(float g){
   lastG = g;
   lastTsUs = nowUs;
 }
+#endif
 
 // Call at the end of each forward cycle
 void checkInertiaEndOfCycle() {
-  if (curState != MOVING_FORWARD && !inertiaFoundThisCycle) {
+  if (inertiaArmed && !inertiaDoneThisCycle) {
     Serial.println("INERTIA: nothing found in forward cycle");
   }
-  if (curState != MOVING_FORWARD) {
-    inertiaFoundThisCycle = false; // reset for next cycle
-  }
+  inertiaArmed = false;
+  inertiaDoneThisCycle = false;  // reset for next forward stroke
 }
 
 /* ---------------- Behaviour & metric logic ------------------ */
@@ -337,14 +382,34 @@ void updateBehaviour(float w) {
     Serial.println("touching");
     firstDeltaStep = forwardSteps;
     delta10Captured = true;
+
+    // NEW: arm inertia window from this moment
+    inertiaArmed = true;
+    tTouchMs = millis();
+    touchGraphIdx = histIndexByTime(tTouchMs);  // start index for integration
   }
 
   /* ---------- DOWN-WEIGHT (50 steps after contact) ----- */
   if (delta10Captured && !downCaptured && forwardSteps >= firstDeltaStep + DOWN_DELAY_STEPS) {
     downWeight = w;
     downCaptured = true;
-    // Use current time to find the nearest plotted sample
-    downGraphIdx = histIndexByTime(millis());   // ← replace old assignment
+    downGraphIdx = histIndexByTime(millis());
+
+    // NEW: compute inertia only within [touch -> down]
+    if (inertiaArmed && !inertiaDoneThisCycle) {
+      // integrate over the ring from touchGraphIdx → downGraphIdx
+      double impulseNs = integrateImpulseAboveDown(touchGraphIdx, downGraphIdx, downWeight);
+      float duration_ms = (float)(tsHist[downGraphIdx] - tsHist[touchGraphIdx]);
+      if (duration_ms < 0) duration_ms = 0; // guard for wrap
+
+      Serial.printf("INERTIA: dur=%.1f ms, impulse=%.4f N·s, Fsteady=%.1f g\n",
+                    duration_ms, impulseNs, downWeight);
+
+      inertiaDoneThisCycle = true;
+    }
+
+    // Once down is captured, the inertia window is definitely over
+    inertiaArmed = false;
   }
 
   /* ---------- LET-OFF detection (after-touch) ---------- */
@@ -817,7 +882,7 @@ void loop() {
     lastPoll = now;
     float w = scale.get_units(1);
     pushSample(w);
-    onForceSample(w);       // <<< NEW inertia tracking
+    // onForceSample(w);  // removed
     updateBehaviour(w);
     drawScreen(w);
   }
