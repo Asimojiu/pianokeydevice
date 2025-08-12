@@ -220,6 +220,111 @@ void resetCycle() {
   aftertouchDist = 0.0f;
 }
 
+// ===== Inertia Measurement Config =====
+const float TOUCH_LEVEL_G      = 2.0f;
+const float SLOPE_THRESH_G     = 2.0f;
+const uint8_t SLOPE_WIN        = 3;
+const uint8_t STABLE_WIN       = 8;
+const float STABLE_DFDT_G      = 0.1f;
+const float STABLE_VAR_G2      = 0.20f;
+
+bool inertiaActive = false;       // currently tracking inertia segment
+bool inertiaFoundThisCycle = false; // true if we detected in this forward stroke
+
+uint32_t tTouchUs = 0, tStableUs = 0;
+float FsteadyG = 0.0f;
+double impulseNs = 0.0;
+float lastG = 0.0f;
+uint32_t lastTsUs = 0;
+
+struct Samp { float g; uint32_t us; };
+const uint8_t WIN = 20;
+Samp win[WIN]; uint8_t widx = 0; uint8_t wfilled = 0;
+
+inline void pushWin(float g, uint32_t us){
+  win[widx] = {g, us};
+  widx = (widx + 1) % WIN;
+  if (wfilled < WIN) wfilled++;
+}
+
+bool computeSlopeVar(float& slope_g_per_samp, float& var_g2, float& mean_g) {
+  const uint8_t n = min(wfilled, (uint8_t)max((int)STABLE_WIN, (int)SLOPE_WIN));
+  if (n < 2) return false;
+  float sum=0, sum2=0;
+  for (uint8_t i=0;i<n;i++){
+    const Samp& s = win[(widx + WIN - 1 - i) % WIN];
+    sum += s.g; sum2 += s.g * s.g;
+  }
+  mean_g = sum / n;
+  var_g2 = (sum2 / n) - (mean_g * mean_g);
+  const Samp& a = win[(widx + WIN - 1) % WIN];
+  const Samp& b = win[(widx + WIN - 1 - min(SLOPE_WIN, (uint8_t)(n-1))) % WIN];
+  slope_g_per_samp = (a.g - b.g) / (float)min(SLOPE_WIN, (uint8_t)(n-1));
+  return true;
+}
+
+void onForceSample(float g){
+  // Only run during forward movement
+  if (curState != MOVING_FORWARD) return;
+
+  const uint32_t nowUs = micros();
+  pushWin(g, nowUs);
+
+  float slope, var, mean;
+  if (!computeSlopeVar(slope, var, mean)) return;
+
+  static bool armed = true;
+
+  // Detect touch
+  if (armed && slope > SLOPE_THRESH_G && g > TOUCH_LEVEL_G) {
+    inertiaActive = true;
+    tTouchUs = nowUs;
+    impulseNs = 0.0;
+    FsteadyG = 0.0f;
+    armed = false;
+  }
+
+  // Accumulate impulse
+  if (inertiaActive) {
+    if (lastTsUs != 0) {
+      const float dt_s = (nowUs - lastTsUs) * 1e-6f;
+      const float g_above = max(0.0f, ((lastG + g) * 0.5f) - FsteadyG);
+      impulseNs += (double)g_above * 0.00980665 * dt_s;
+    }
+  }
+
+  // Detect stability
+  const bool stable = (fabs(slope) < STABLE_DFDT_G) && (var < STABLE_VAR_G2);
+  if (inertiaActive && stable) {
+    tStableUs = nowUs;
+    FsteadyG = mean;
+    inertiaActive = false;
+    inertiaFoundThisCycle = true;  // mark success
+
+    const float duration_ms = (tStableUs - tTouchUs) * 1e-3f;
+    Serial.printf("INERTIA: dur=%.1f ms, impulse=%.4f N·s, Fsteady=%.1f g\n",
+                  duration_ms, impulseNs, FsteadyG);
+  }
+
+  // Re-arm
+  if (!armed && !inertiaActive && g < (TOUCH_LEVEL_G * 0.5f)) {
+    armed = true;
+  }
+
+  lastG = g;
+  lastTsUs = nowUs;
+}
+
+// Call at the end of each forward cycle
+void checkInertiaEndOfCycle() {
+  if (curState != MOVING_FORWARD && !inertiaFoundThisCycle) {
+    Serial.println("INERTIA: nothing found in forward cycle");
+  }
+  if (curState != MOVING_FORWARD) {
+    inertiaFoundThisCycle = false; // reset for next cycle
+  }
+}
+
 /* ---------------- Behaviour & metric logic ------------------ */
 void updateBehaviour(float w) {
   if (curState == STOPPED || btnState.manualControlActive) return;  // Don't update behavior when stopped or in manual control
@@ -251,6 +356,7 @@ void updateBehaviour(float w) {
 
   /* ---------- TRIGGER REVERSAL ------------------------- */
   if (curState == MOVING_FORWARD && (delta > DELTA2_G || w > MAX_WEIGHT_G)) {
+    checkInertiaEndOfCycle();   // <<< NEW
     curState = MOVING_BACKWARD;
     stepsRemaining = STEPS_PER_REV;
     backStepsTaken = 0;
@@ -711,6 +817,7 @@ void loop() {
     lastPoll = now;
     float w = scale.get_units(1);
     pushSample(w);
+    onForceSample(w);       // <<< NEW inertia tracking
     updateBehaviour(w);
     drawScreen(w);
   }
